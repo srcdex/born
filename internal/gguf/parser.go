@@ -31,6 +31,8 @@ func ParseFile(path string) (*File, error) {
 	// Get file size
 	stat, err := f.Stat()
 	if err != nil {
+		// Unreachable in practice: fstat on the handle os.Open just
+		// returned does not fail for a regular file. Guarded defensively.
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
 

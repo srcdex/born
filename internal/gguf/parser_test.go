@@ -3,6 +3,8 @@ package gguf
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -292,6 +294,48 @@ func TestInvalidVersion(t *testing.T) {
 	_, err := Parse(bytes.NewReader(buf.Bytes()))
 	if err == nil {
 		t.Error("Parse should fail with invalid version")
+	}
+}
+
+func TestParseFile(t *testing.T) {
+	buf := createTestGGUF(t)
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	file, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+
+	if file.FilePath != path {
+		t.Errorf("FilePath = %q, want %q", file.FilePath, path)
+	}
+	if file.FileSize != int64(buf.Len()) {
+		t.Errorf("FileSize = %d, want %d", file.FileSize, buf.Len())
+	}
+	if arch := file.Architecture(); arch != "llama" {
+		t.Errorf("Architecture() = %q, want %q", arch, "llama")
+	}
+}
+
+func TestParseFileNotFound(t *testing.T) {
+	_, err := ParseFile(filepath.Join(t.TempDir(), "missing.gguf"))
+	if err == nil {
+		t.Error("ParseFile should fail for a missing file")
+	}
+}
+
+func TestParseFileInvalidContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invalid.gguf")
+	if err := os.WriteFile(path, []byte("not a GGUF file"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	_, err := ParseFile(path)
+	if err == nil {
+		t.Error("ParseFile should fail with invalid content")
 	}
 }
 
