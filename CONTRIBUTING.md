@@ -422,6 +422,7 @@ All PRs run through CI:
 | **Build WASM** | `GOOS=js GOARCH=wasm go build ./...` |
 | **Benchmarks** | Run performance benchmarks |
 | **Codecov** | Coverage reporting |
+| **GPU Tests** | Linux, Vulkan and gl on an NVIDIA T4 (machine.dev); not required to merge |
 
 ### Merge Strategy
 

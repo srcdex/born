@@ -1,0 +1,163 @@
+name: GPU Tests
+
+# Real-driver GPU coverage.
+#
+# The Tests workflow exercises the WebGPU backend through the software
+# adapter (GOGPU_GRAPHICS_API=software). That is portable but slow — on the
+# v0.9.18 push internal/backend/webgpu alone took 437s on Linux and 613s on
+# Windows, around 95% of the test time — and it never touches a vendor
+# driver, so driver-specific behavior and real VRAM pressure go untested.
+#
+# This workflow runs the same packages on a machine.dev runner with an
+# NVIDIA T4, once per real-driver backend the platform can reach. It is
+# deliberately not part of the `test` gate job in test.yml: the runner is
+# external, and its failures should not block a merge until it has proven
+# stable.
+
+# Every branch, so a topic branch can prove the GPU path before it reaches
+# main, and every pull request, so a contribution from a fork is covered
+# too — a fork's own pushes never run here.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-gpu-tests:
+    # Linux only. machine.dev offers no macOS or Windows runners, and the
+    # other real-driver backends are out of reach anyway: dx12 needs
+    # Windows, and metal needs darwin, where internal/backend/webgpu is not
+    # even compiled (//go:build windows || linux).
+    name: GPU Tests - Linux / ${{ matrix.api }} (NVIDIA T4)
+    # machine.dev provisions an ephemeral VM per job, selected entirely by
+    # this label. Append /tenancy=spot to cut the cost by roughly a fifth
+    # once the job has proven stable; spot instances can be interrupted
+    # mid-run.
+    runs-on: machine/gpu=t4
+    # A same-repo pull request is already covered by the push that created
+    # it, so only a fork's pull request needs the event.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    # The first run took 13m49s for both packages under -race alone; running
+    # each package plain as well, plus the benchmarks, needs the headroom.
+    timeout-minutes: 60
+    strategy:
+      # The two backends are independent evidence: a GL failure must not
+      # cancel the Vulkan run, which is the one that matters most.
+      fail-fast: false
+      matrix:
+        # Vulkan is the primary backend; gl reaches the same GPU through
+        # gogpu's EGL path (hal/gles/adapter_linux.go), which is less
+        # travelled — gogpu keeps its own GL integration tests behind an
+        # `integration` build tag.
+        api: [vulkan, gl]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        cache: true
+
+    # The runner image ships the CUDA stack, but wgpu dlopens its API
+    # libraries at runtime and neither loader comes with the driver:
+    # libvulkan.so.1 for Vulkan, libEGL.so.1 for gl. The NVIDIA driver
+    # supplies the Vulkan ICD at /etc/vulkan/icd.d/nvidia_icd.json.
+    - name: Install the GPU API loaders
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libvulkan1 vulkan-tools libegl1
+
+    # Proves the driver sees the card at all, whichever API the tests use.
+    - name: Show the GPU
+      run: nvidia-smi
+
+    # Fails the job when no Vulkan device is visible, rather than letting
+    # every GPU test skip and report success. There is no equally cheap
+    # equivalent for EGL, so the gl leg relies on the probe step below.
+    - name: Show the Vulkan device
+      if: matrix.api == 'vulkan'
+      run: vulkaninfo --summary
+
+    - name: Download dependencies
+      run: go mod download
+
+    # Refuses to run the suite unless a hardware adapter answered. The check
+    # lives in the package as TestRequireHardwareBackend, so its exit code is
+    # the signal — nothing here reads the output.
+    - name: Require a hardware GPU
+      env:
+        GOGPU_GRAPHICS_API: ${{ matrix.api }}
+        BORN_REQUIRE_GPU: '1'
+      run: go test -v -run TestRequireHardwareBackend ./internal/backend/webgpu/
+
+    # One package per step, and no pipe: `go test` streams output live for a
+    # single package but buffers it per package when given several, so a
+    # 13-minute run otherwise prints nothing until it ends.
+    #
+    # Each package runs twice, plain then under the race detector, so a
+    # failure says which it is. The first run tells you whether the code
+    # works on this driver at all; -race adds concurrency faults on top, and
+    # conflating the two makes a shader-compilation panic and a data race
+    # look like one failure. A plain failure skips the -race step, which is
+    # the right order to read them in anyway.
+    #
+    # No -short: the availability probe in internal/backend/webgpu has to
+    # run for the tests to use the GPU rather than skip.
+    - name: Run the webgpu backend tests
+      shell: bash
+      env:
+        GOGPU_GRAPHICS_API: ${{ matrix.api }}
+      run: go test -v -timeout 20m ./internal/backend/webgpu/...
+
+    - name: Run the webgpu backend tests under the race detector
+      shell: bash
+      env:
+        GOGPU_GRAPHICS_API: ${{ matrix.api }}
+      run: go test -v -race -timeout 20m ./internal/backend/webgpu/...
+
+    # Only the flash-attention tests in internal/nn reach the GPU; its other
+    # ~200 tests are CPU tensor tests that test.yml already runs. There is
+    # no reason to rent a T4 to repeat them.
+    #
+    # A -run pattern that matches nothing is not an error: go test prints
+    # "no tests to run" and exits 0. Listing the selection first turns a
+    # renamed test into a failure rather than a step that passes having run
+    # nothing, and names in the log what the step went on to run. The race
+    # step below needs no repeat — this one fails the job first.
+    - name: Run the nn GPU tests
+      shell: bash
+      env:
+        GOGPU_GRAPHICS_API: ${{ matrix.api }}
+      run: |
+        go test -list FlashAttentionGPU ./internal/nn/ | grep TestFlashAttentionGPU
+        go test -v -run FlashAttentionGPU -timeout 20m ./internal/nn/
+
+    - name: Run the nn GPU tests under the race detector
+      shell: bash
+      env:
+        GOGPU_GRAPHICS_API: ${{ matrix.api }}
+      run: go test -v -race -run FlashAttentionGPU -timeout 20m ./internal/nn/
+
+    # The benchmarks the suite itself recommends (TestPrintBenchmarkInfo).
+    # They have only ever measured the software rasterizer, where the
+    # numbers mean nothing; on the Vulkan leg they are a baseline worth
+    # having, and a second proof the card was used. Informational — a
+    # regression here should not fail the job.
+    - name: Benchmark against the driver
+      if: matrix.api == 'vulkan'
+      continue-on-error: true
+      shell: bash
+      env:
+        GOGPU_GRAPHICS_API: ${{ matrix.api }}
+      run: go test -run '^$' -bench=. -benchmem -timeout 20m ./internal/backend/webgpu/

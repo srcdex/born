@@ -3,10 +3,46 @@
 package webgpu
 
 import (
+	"os"
 	"testing"
 
 	"github.com/born-ml/born/internal/tensor"
+	"github.com/gogpu/gputypes"
 )
+
+// TestRequireHardwareBackend turns two silent conditions into a failure when
+// BORN_REQUIRE_GPU is set. Neither shows up as a failing test otherwise: a
+// backend that cannot initialize leaves every GPU test skipped while go test
+// exits 0, and gogpu keeps its software provider among the candidates
+// whatever backend mask it is given, so a CPU rasterizer can answer a request
+// for a real driver. CI runs this before the suite, so a run that reports
+// green has actually used the GPU.
+func TestRequireHardwareBackend(t *testing.T) {
+	if os.Getenv("BORN_REQUIRE_GPU") == "" {
+		t.Skip("BORN_REQUIRE_GPU is not set")
+	}
+
+	if !IsAvailable() {
+		t.Fatal("WebGPU is unavailable: every GPU test would skip")
+	}
+
+	backend, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Release()
+
+	info := backend.AdapterInfo()
+	if info == nil {
+		t.Fatal("adapter info is unavailable, so the adapter cannot be verified")
+	}
+	if info.DeviceType == gputypes.DeviceTypeCPU {
+		t.Fatalf("got the CPU adapter %q while %q was requested",
+			info.Name, os.Getenv("GOGPU_GRAPHICS_API"))
+	}
+
+	t.Logf("hardware adapter: %s (%s), %s", info.Name, info.Vendor, info.DriverInfo)
+}
 
 func TestIsAvailable(t *testing.T) {
 	available := IsAvailable()
